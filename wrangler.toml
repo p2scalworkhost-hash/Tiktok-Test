@@ -1,4 +1,4 @@
-name = "kaneskn-worker"
+name = "kaneskn-worker1"
 main = "src/index.js"
 compatibility_date = "2024-09-01"
 
