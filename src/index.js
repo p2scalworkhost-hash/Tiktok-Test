@@ -46,6 +46,18 @@ export default {
         return corsResponse(env, await handleList(env));
       }
 
+      if (path === '/api/publish' && request.method === 'POST') {
+        return corsResponse(env, await handlePublish(request, env));
+      }
+
+      if (path === '/api/facebook-pages') {
+        return corsResponse(env, await handleFacebookPages(request, env));
+      }
+
+      if (path === '/api/post-history' && request.method === 'GET') {
+        return corsResponse(env, await handlePostHistory(request, env));
+      }
+
       const clipMatch = path.match(/^\/api\/clips\/([a-zA-Z0-9_-]+)$/);
       if (clipMatch) {
         const id = clipMatch[1];
@@ -151,6 +163,7 @@ async function previewTikTok(clipUrl) {
     preview: {
       tiktokUrl: clipUrl,
       source: 'tiktok',
+      provider: tiktokData.provider || '',
       title: data.title || '',
       duration: data.duration || 0,
       videoUrl: videoUrl,
@@ -1735,3 +1748,173 @@ async function scrapeShopeeProductTitle(productUrl, html) {
 
   return extractProductTitleFromHtml(html);
 }
+
+// ═══════════════════════════════════════════
+// NEW SECURE WEBHOOK PROXY METHODS
+// ═══════════════════════════════════════════
+
+async function handlePublish(request, env) {
+  try {
+    const body = await request.json();
+    const action = body.action || 'post';
+    const tiktokUrl = body.tiktokUrl?.trim();
+    if (!tiktokUrl) {
+      return json({ error: 'กรุณากรอกลิงก์คลิปวิดีโอ' }, 400);
+    }
+
+    const source = detectSource(tiktokUrl);
+    let videoUrl = '';
+    let previewTitle = '';
+
+    // Fetch preview data internally to get direct CDN URL and metadata
+    try {
+      let previewResult;
+      if (source === 'tiktok') {
+        previewResult = await previewTikTok(tiktokUrl);
+      } else if (source === 'instagram') {
+        previewResult = await previewInstagram(tiktokUrl);
+      } else if (source === 'xiaohongshu') {
+        previewResult = await previewXiaohongshu(tiktokUrl);
+      } else {
+        previewResult = await previewTikTok(tiktokUrl);
+      }
+      const previewJson = await previewResult.json();
+      if (previewJson.success && previewJson.preview) {
+        videoUrl = previewJson.preview.videoUrl;
+        previewTitle = previewJson.preview.title || '';
+      }
+    } catch (err) {
+      console.error('Internal preview fetch failed:', err);
+    }
+
+    if (!videoUrl) {
+      videoUrl = body.videoUrl || '';
+    }
+
+    if (!videoUrl) {
+      return json({ error: 'ไม่สามารถดึงคลิปวิดีโอจากลิงก์ที่ระบุได้' }, 400);
+    }
+
+    // Download video binary
+    const videoRes = await fetch(videoUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': source === 'instagram' ? 'https://www.instagram.com/' : 'https://www.tiktok.com/'
+      }
+    });
+    if (!videoRes.ok) {
+      return json({ error: `ดาวน์โหลดวิดีโอล้มเหลว: ${videoRes.status}` }, 502);
+    }
+    const videoBlob = await videoRes.blob();
+
+    // Prepare FormData for n8n Webhook direct upload
+    const formData = new FormData();
+    formData.append('video', videoBlob, `${Date.now()}_video.mp4`);
+    formData.append('action', action);
+    formData.append('productName', body.productName || '');
+    formData.append('productUrl', body.productUrl || '');
+    formData.append('platform', body.platform || '');
+    formData.append('note', body.note || '');
+    formData.append('shopeeAppId', body.shopeeAppId || '');
+    formData.append('shopeeSecret', body.shopeeSecret || '');
+    if (body.shopeeSettings) {
+      formData.append('shopeeSettings', typeof body.shopeeSettings === 'string' ? body.shopeeSettings : JSON.stringify(body.shopeeSettings));
+    }
+    formData.append('tiktokUrl', tiktokUrl);
+    formData.append('title', body.title || previewTitle);
+    
+    // User meta
+    formData.append('userId', body.userId || '');
+    formData.append('userEmail', body.userEmail || '');
+    formData.append('userName', body.userName || '');
+    formData.append('userPhotoURL', body.userPhotoURL || '');
+    formData.append('userProviderId', body.userProviderId || '');
+    formData.append('firebaseIdToken', body.firebaseIdToken || '');
+    if (body.loginUser) {
+      formData.append('loginUser', typeof body.loginUser === 'string' ? body.loginUser : JSON.stringify(body.loginUser));
+    }
+
+    // Facebook Page info
+    formData.append('fbPageId', body.fbPageId || '');
+    formData.append('fbPageName', body.fbPageName || '');
+    
+    let pageToken = body.fbPageToken || body.pageToken || '';
+    formData.append('fbPageToken', pageToken);
+    formData.append('pageToken', pageToken);
+    if (body.fbPage) {
+      formData.append('fbPage', typeof body.fbPage === 'string' ? body.fbPage : JSON.stringify(body.fbPage));
+    }
+
+    // Product image URL
+    formData.append('productImageUrl', body.productImageUrl || '');
+
+    // POST to n8n Webhook URL (multipart/form-data)
+    const n8nWebhookUrl = env.N8N_WEBHOOK_URL || 'https://n8n-9ych.srv1728018.hstgr.cloud/webhook/273e7d20-ebd4-4067-9d80-90eb34b1b900';
+    const n8nRes = await fetch(n8nWebhookUrl, {
+      method: 'POST',
+      body: formData
+    });
+
+    if (!n8nRes.ok) {
+      const errorText = await n8nRes.text();
+      return json({ error: `ส่งเข้า n8n Webhook ล้มเหลว HTTP Status ${n8nRes.status}: ${errorText}` }, 502);
+    }
+
+    let n8nJson = {};
+    try {
+      n8nJson = await n8nRes.json();
+    } catch {
+      n8nJson = { status: 'success' };
+    }
+
+    return json({
+      success: true,
+      n8nResponse: n8nJson
+    });
+
+  } catch (err) {
+    console.error('Publish handler error:', err);
+    return json({ error: err.message || 'Internal Server Error' }, 500);
+  }
+}
+
+async function handleFacebookPages(request, env) {
+  const n8nDbPagesUrl = env.N8N_DB_PAGES_URL || 'https://n8n-9ych.srv1728018.hstgr.cloud/webhook/DbFacebook';
+  
+  if (request.method === 'POST') {
+    const body = await request.json();
+    const res = await fetch(n8nDbPagesUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) {
+      return json({ error: `n8n DB Pages Error ${res.status}` }, 502);
+    }
+    let data = {};
+    try { data = await res.json(); } catch { data = { status: 'ok' }; }
+    return json(data);
+  } else {
+    const url = new URL(request.url);
+    const targetUrl = `${n8nDbPagesUrl}${url.search}`;
+    const res = await fetch(targetUrl, { method: 'GET' });
+    if (!res.ok) {
+      return json({ error: `n8n DB Pages Error ${res.status}` }, 502);
+    }
+    const data = await res.json();
+    return json(data);
+  }
+}
+
+async function handlePostHistory(request, env) {
+  const n8nDbHistoryUrl = env.N8N_DB_HISTORY_URL || 'https://n8n-9ych.srv1728018.hstgr.cloud/webhook/InfoHis';
+  const url = new URL(request.url);
+  const targetUrl = `${n8nDbHistoryUrl}${url.search}`;
+  const res = await fetch(targetUrl, { method: 'GET' });
+  if (!res.ok) {
+    return json({ error: `n8n DB History Error ${res.status}` }, 502);
+  }
+  const data = await res.json();
+  return json(data);
+}
+
